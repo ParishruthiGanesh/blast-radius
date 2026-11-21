@@ -96,6 +96,20 @@ class Maps:
                 bits |= pair[1]
         return bits
 
+    def function_hits(self, rel: str, function: tuple[int, int], run_only: bool = False) -> int:
+        """Tests that ran the body of the function spanning `function`. Its
+        `def` line and decorators run at import for everybody, so they do not count."""
+        body_start = function[0]
+        for unit in self.units_overlapping(rel, function[0], function[0]):
+            if unit[KIND] == "d" and unit[FUNC] == function:
+                body_start = unit[END] + 1
+        bits = (self.run_hits if run_only else self.hits)(rel, body_start, function[1])
+        for line in range(function[0], body_start):
+            pair = self.entered.get(rel, {}).get(line)
+            if pair:
+                bits |= pair[1] if run_only else pair[0] | pair[1]
+        return bits
+
     def file_hits(self, rel: str) -> int:
         bits = 0
         for pair in self.lines.get(rel, {}).values():
@@ -189,14 +203,14 @@ class Maps:
                         if not units:
                             function = self.enclosing_function(rel, number)
                             if function:
-                                bits |= hits(rel, *function)
+                                bits |= self.function_hits(rel, function, run_only)
                             continue
                         for unit in units:
                             kind = unit[KIND]
                             if kind == "f":
                                 bits |= hits(rel, unit[START], unit[END])
                             elif kind == "d":
-                                bits |= hits(rel, *unit[FUNC])
+                                bits |= self.function_hits(rel, unit[FUNC], run_only)
                             elif kind == "k":
                                 if name not in unit[NAMES]:
                                     return None  # used as a base class or decorator
@@ -541,11 +555,11 @@ class Analyzer:
         handled = False
         function = maps.enclosing_function(rel, first if block.old else max(1, first - 1))
         if function and not (function[0] >= first and block.old == []):
-            result.bits |= maps.hits(rel, *function)
+            result.bits |= maps.function_hits(rel, function)
             handled = True
         for unit in units:
             if unit[KIND] == "f":
-                result.bits |= maps.hits(rel, *unit[FUNC]) if unit[FUNC] else maps.importers(rel)
+                result.bits |= maps.function_hits(rel, unit[FUNC]) if unit[FUNC] else maps.importers(rel)
                 handled = True
             elif unit[KIND] == "d":
                 touched = block.old and unit[START] <= last and unit[END] >= first
@@ -649,10 +663,10 @@ class Analyzer:
         if kind == "f":
             result.bits |= maps.hits(rel, unit[START], unit[END])
         elif kind == "d":
-            result.bits |= maps.hits(rel, *unit[FUNC])
+            result.bits |= maps.function_hits(rel, unit[FUNC])
             outer_kind, outer_function = unit[INNER]
             if outer_kind == "f" and outer_function:
-                result.bits |= maps.hits(rel, *outer_function)
+                result.bits |= maps.function_hits(rel, outer_function)
         else:
             self._import_time(result, rel, unit, first, last, tuple(unit[NAMES]) + names, narrow, replacement)
 
