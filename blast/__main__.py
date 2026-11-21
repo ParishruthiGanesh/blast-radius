@@ -45,6 +45,13 @@ BUDGET = knob("BLAST_BUDGET", 30.0)
 # an edited data fixture almost never is.
 QUIET_CODE = knob("BLAST_QUIET_CODE", 0.5)
 QUIET_DATA = knob("BLAST_QUIET_DATA", 0.07)
+# When the light tests are too many to run, run this many of the cheapest as a probe.
+PROBE = int(knob("BLAST_PROBE", 40))
+# After a first failure, keep running until this many tests are checked or this much
+# more CPU is spent; heavy tests are dropped if fewer than this share of them failed.
+SPREAD_TESTS = int(knob("BLAST_SPREAD_TESTS", 30))
+SPREAD_CPU = knob("BLAST_SPREAD_CPU", 0.5)
+SPREAD_SHARE = knob("BLAST_SPREAD_SHARE", 0.1)
 # When a check run does hit a failure, it has used about this share of its CPU.
 EARLY = knob("BLAST_EARLY", 0.3)
 # Fixed CPU cost of one checking run (fork, import, collection).
@@ -177,12 +184,20 @@ class Selector:
         # Checking pays when its expected cost beats selecting everything unchecked:
         #   quiet * cpu + (1 - quiet) * (EARLY * cpu + unchecked)  <  unchecked
         quiet = QUIET_DATA if result.data_changed else QUIET_CODE
-        worth = light_cpu * (quiet + EARLY * (1 - quiet)) < quiet * blind_cost or result.sample
-        if late or not worth or light_cpu > BUDGET or not (light or probes):
+        worth = light_cpu * (quiet + EARLY * (1 - quiet)) < quiet * blind_cost and light_cpu <= BUDGET
+        if late or not (light or probes):
             return sorted(candidates), f"unchecked: {note}{' (deadline)' if late else ''}"
+        if worth or result.sample:
+            order = probes + light
+        elif heavy and PROBE:
+            # Too many light tests to run them all, but the heavy ones dominate the
+            # cost: run the cheapest few to learn how widely the change breaks things.
+            order = light[:PROBE]
+            note = f"probe of {len(order)}; {note}"
+        else:
+            return sorted(candidates), f"unchecked: {note}"
 
         root = self.workspace.build(files)
-        order = probes + light
         fresh = result.touches_sqlglot or result.sample
         limit = lambda test_id: 6 * self.cpu(self.number[test_id]) + 6  # noqa: E731
         run = runner.Run(
@@ -198,6 +213,7 @@ class Selector:
         broken = None
         slow: list[tuple[float, str]] = []
         last_cpu = 0.0
+        extra = 0.0
         for kind, test_id in run.events():
             number = self.number.get(test_id)
             if kind == "D":
@@ -208,7 +224,8 @@ class Selector:
                 passed.add(number)
             elif kind in "FTMX" and number is not None:
                 failed.add(number)
-                break
+                if kind in "TX" or not heavy:
+                    break
             elif kind == "C":
                 broken = f"collection error in {test_id}"
                 break
@@ -218,6 +235,12 @@ class Selector:
             elif kind in "TX":
                 broken = "run died outside a test"
                 break
+            if failed and kind in "PF":
+                # With heavy tests at stake, keep going briefly: how many light
+                # tests fail says whether the heavy ones are likely to.
+                extra += last_cpu
+                if len(passed) + len(failed) >= SPREAD_TESTS or extra > SPREAD_CPU:
+                    break
         run.kill()
         if not failed and not broken and set(order) - passed:
             # The run ended without reporting every test (pytest refused to start,
@@ -238,14 +261,20 @@ class Selector:
             if broken.startswith("collection"):
                 wide |= {n for n in self.everything if self.file_of[n] == test_id.split("::")[0]}
             return sorted(wide), f"{broken}: {len(wide)} tests"
-        if failed:
-            selected = (candidates - passed) | failed
-            return sorted(selected), f"failure found after {len(passed)} passes; {note}"
+        checked = len(passed) + len(failed)
         remaining = candidates - passed
+        if failed:
+            # Heavy tests fail when a change breaks things widely, not when it
+            # breaks a few tests in many: drop them only on good evidence of the latter.
+            narrow = checked >= SPREAD_TESTS and len(failed) < SPREAD_SHARE * checked
+            dropped = set(heavy) if narrow else set()
+            selected = (remaining | failed) - dropped
+            return sorted(selected), f"{len(failed)} of {checked} checked fail, {len(dropped)} heavy dropped; {note}"
         if not remaining:
             return [], f"all {len(passed)} candidates pass; {note}"
-        if len(passed) >= EVIDENCE and all(n in heavy for n in remaining):
-            return [], f"all {len(passed)} light candidates pass, {len(remaining)} heavy dropped; {note}"
+        if len(passed) >= EVIDENCE:
+            remaining -= set(heavy)
+            return sorted(remaining), f"all {len(passed)} checked pass, {len(heavy)} heavy dropped; {note}"
         return sorted(remaining), f"{len(passed)} pass, {len(remaining)} unchecked kept; {note}"
 
 

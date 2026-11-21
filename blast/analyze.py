@@ -324,6 +324,14 @@ def _statement_run(lines: list[str]) -> int | None:
     return base
 
 
+def _only_pass(lines: list[str]) -> bool:
+    try:
+        body = ast.parse(textwrap.dedent("\n".join(lines))).body
+    except (SyntaxError, ValueError):
+        return False
+    return bool(body) and all(isinstance(node, ast.Pass) for node in body)
+
+
 def _lambda_holding(source: list[str], unit: tuple, line: int, start: int, end: int) -> int | None:
     """If columns [start, end) of `line` lie wholly inside the body of a lambda
     written in this import-time statement, return the line the lambda starts on."""
@@ -573,6 +581,8 @@ class Analyzer:
         if block.old:
             result.bits |= maps.hits(rel, first, last)
             return True
+        if _only_pass(block.new):
+            return True  # an added `pass` does nothing
         if after_indent == base:
             anchor = after
         else:
