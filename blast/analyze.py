@@ -56,8 +56,9 @@ class Maps:
         self.all_bits = (1 << len(self.tests)) - 1
         self.class_by_name: dict[str, int] = {}
         for (module, qualname), bits in self.classes.items():
-            if module.startswith("sqlglot.") and "." not in qualname:
+            if module.startswith("sqlglot.expressions") and "." not in qualname:
                 self.class_by_name[qualname] = self.class_by_name.get(qualname, 0) | bits
+        self._expressions = None
         self._sources: dict[str, list[str]] | None = None
         self._unit_starts: dict[str, list[int]] = {}
         self._use_cache: dict[str, int | None] = {}
@@ -208,6 +209,26 @@ class Maps:
                                 pending.extend(derived)
         return bits
 
+    def expression_touch(self, name: str) -> int | None:
+        """Tests that created an instance of expression class `exp.<name>` (or a
+        subclass). None when `name` is not an expression class of the pinned commit."""
+        if self._expressions is None:
+            import sys
+
+            if self.pristine not in sys.path:
+                sys.path.append(self.pristine)
+            try:
+                import sqlglot.expressions as expressions
+
+                self._expressions = (expressions, expressions.Expr)
+            except Exception:
+                self._expressions = (None, None)
+        module, base = self._expressions
+        cls = getattr(module, name, None) if module else None
+        if not isinstance(cls, type) or not issubclass(cls, base):
+            return None
+        return self.class_by_name.get(name, 0)
+
     def entered_bits(self, rel: str, first_line: int) -> int:
         pair = self.entered.get(rel, {}).get(first_line)
         return pair[0] | pair[1] if pair else 0
@@ -268,17 +289,16 @@ def _new_names(lines: list[str]) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _entry_names(source: list[str], unit: tuple, first: int, last: int) -> tuple[set[str], bool] | None:
-    """For a changed line inside a dict/set/list literal of an import-time
-    statement: the capitalised names its entry mentions (candidates for
-    expression classes), and whether the entry holds a lambda. None when the
-    lines are not inside such a literal."""
-    text = textwrap.dedent("\n".join(source[unit[START] - 1 : unit[END]]))
+def _entry_facts(lines: list[str], unit_start: int, first: int, last: int) -> tuple[set[str], set[str]] | None:
+    """For lines `first..last` inside a dict/set/list literal of an import-time
+    statement whose text is `lines`: the expression classes its entry names
+    (`exp.Foo`) and the string constants it holds. None when the lines are not
+    inside such a literal."""
     try:
-        tree = ast.parse(text)
+        tree = ast.parse(textwrap.dedent("\n".join(lines)))
     except (SyntaxError, ValueError):
         return None
-    lo, hi = first - unit[START] + 1, last - unit[START] + 1
+    lo, hi = first - unit_start + 1, last - unit_start + 1
     best: list[ast.AST] | None = None
     best_size = None
     for node in ast.walk(tree):
@@ -295,17 +315,15 @@ def _entry_names(source: list[str], unit: tuple, first: int, last: int) -> tuple
                 best, best_size = entry, end - start
     if best is None:
         return None
-    names: set[str] = set()
-    has_lambda = False
+    classes: set[str] = set()
+    strings: set[str] = set()
     for part in best:
         for node in ast.walk(part):
-            if isinstance(node, ast.Attribute) and node.attr[:1].isupper():
-                names.add(node.attr)
-            elif isinstance(node, ast.Name) and node.id[:1].isupper():
-                names.add(node.id)
-            elif isinstance(node, ast.Lambda):
-                has_lambda = True
-    return names, has_lambda
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in ("exp", "expressions"):
+                classes.add(node.attr)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                strings.add(node.value)
+    return classes, strings
 
 
 def _statement_run(lines: list[str]) -> int | None:
@@ -499,7 +517,8 @@ class Analyzer:
                         if holder is not None:
                             result.bits |= maps.entered_bits(rel, holder)
                             continue
-                    self._unit(result, rel, unit, max(first, unit[START]), min(last, unit[END]), (), True)
+                    lo, hi = max(first, unit[START]), min(last, unit[END])
+                    self._unit(result, rel, unit, lo, hi, (), True, block.new[lo - first : hi - first + 1])
                 return
         if self._statements(result, rel, block, old_lines):
             return
@@ -613,7 +632,9 @@ class Analyzer:
                 base &= use
         result.bits |= base
 
-    def _unit(self, result: Result, rel: str, unit: tuple, first: int, last: int, names: tuple[str, ...], narrow: bool) -> None:
+    def _unit(
+        self, result: Result, rel: str, unit: tuple, first: int, last: int, names: tuple[str, ...], narrow: bool, replacement: list[str] | None = None
+    ) -> None:
         maps = self.maps
         kind = unit[KIND]
         if kind == "f":
@@ -624,9 +645,11 @@ class Analyzer:
             if outer_kind == "f" and outer_function:
                 result.bits |= maps.hits(rel, *outer_function)
         else:
-            self._import_time(result, rel, unit, first, last, tuple(unit[NAMES]) + names, narrow)
+            self._import_time(result, rel, unit, first, last, tuple(unit[NAMES]) + names, narrow, replacement)
 
-    def _import_time(self, result: Result, rel: str, unit: tuple, first: int, last: int, names: tuple[str, ...], narrow: bool) -> None:
+    def _import_time(
+        self, result: Result, rel: str, unit: tuple, first: int, last: int, names: tuple[str, ...], narrow: bool, replacement: list[str] | None = None
+    ) -> None:
         """A statement that runs when its module is imported changed."""
         maps = self.maps
         result.import_time = True
@@ -649,17 +672,21 @@ class Analyzer:
             use = maps.use_hits(names)
             if use is not None and use:
                 base &= use
-        if unit[KIND] != "k" and narrow and unit[END] > unit[START]:
-            # One entry of a big table changed (TRANSFORMS, FUNCTIONS, type metadata...):
-            # only tests that used an expression class the entry mentions can see it.
-            entry = _entry_names(maps.sources().get(rel, []), unit, first, last)
-            if entry is not None:
-                touch = 0
-                known = False
-                for name in entry[0]:
-                    if name in maps.class_by_name:
-                        known = True
-                        touch |= maps.class_by_name[name]
-                if known:
+        if unit[KIND] != "k" and narrow and replacement is not None and unit[END] > unit[START]:
+            # One entry of a big table changed (TRANSFORMS, FUNCTIONS, type metadata...).
+            # If the entry is about expression classes, before and after, only tests
+            # that created such an expression can see the difference.
+            source = maps.sources().get(rel, [])
+            old_text = source[unit[START] - 1 : unit[END]]
+            new_text = list(old_text)
+            new_text[first - unit[START] : last - unit[START] + 1] = replacement
+            before = _entry_facts(old_text, unit[START], first, last)
+            after = _entry_facts(new_text, unit[START], first, last)
+            if before and after and before[1] == after[1] and before[0] | after[0]:
+                touches = [maps.expression_touch(name) for name in before[0] | after[0]]
+                if all(touch is not None for touch in touches):
+                    touch = 0
+                    for bits in touches:
+                        touch |= bits
                     base &= touch | lambdas
         result.bits |= base | lambdas
