@@ -200,12 +200,16 @@ class Selector:
                 broken = "run died outside a test"
                 break
         run.kill()
+        if not failed and not broken and set(order) - passed:
+            # The run ended without reporting every test (pytest refused to start,
+            # a conftest or option is broken...): nothing can be trusted.
+            broken = "run died before reporting every test"
         if slow:
             slow.sort(reverse=True)
             log("  measured", round(sum(c for c, _ in slow), 1), "top:", [(c, t.split("::")[-1], self.cpu(self.number[t])) for c, t in slow[:8]])
         if broken or failed & set(probes):
             # Something run-wide is wrong; do not trust narrowing.
-            if result.sample or broken and broken.startswith("run died"):
+            if result.sample or not broken or broken.startswith("run died"):
                 return self.everything, f"everything: {broken or 'probe failed'}"
             wide = set(candidates)
             for module in result.smoke:

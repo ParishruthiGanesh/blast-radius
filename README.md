@@ -1,70 +1,91 @@
-# Blast Radius starter
+# Blast Radius entry — Team Inventors
 
-A working submission for the Blast Radius track. It runs every test on every commit, so it never misses a failure and scores badly. Your job is to run less without missing.
+A test selector for [sqlglot](https://github.com/tobymao/sqlglot) at commit
+`eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, built on the official starter kit
+for the RWX Blast Radius track of the Builders Buildathon.
 
-## The problem
+For every patch it prints which tests to run and how to split them across
+workers. It is built to never leave out a failing test (a miss costs 300 s)
+and, after that, to run as little as possible.
 
-Your image gets a batch of code changes to [sqlglot](https://github.com/tobymao/sqlglot) at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`. For each change, print which tests to run and how to split them across up to 8 workers.
+The organisers' own documents are kept unchanged: [STARTER_README.md](STARTER_README.md)
+(the starter README), [SCORING.md](SCORING.md), `score.py`, `Makefile` and
+`requirements.lock`.
 
-| | |
+## How it works
+
+**At image build** (`Dockerfile`, network allowed, about 4 minutes):
+
+1. Clone sqlglot at the pinned commit and install the pinned `requirements.lock`.
+2. `tools/build_maps.py` runs every test once under a tracer (`blast/tracer.py`,
+   `sys.monitoring`) and records, per test: the source lines it executed
+   (import time and run time kept apart), the sqlglot classes it used, and the
+   repository files it opened. It also indexes the sources (`blast/static_index.py`)
+   and measures each test's CPU time. The result is `/app/maps/maps.pkl.z` (about 1 MB).
+
+Nothing is committed that was computed ahead of time: the maps are rebuilt from
+the pinned source on every build and describe that commit only. There is no
+table from a patch, or from a kind of edit, to tests.
+
+**At run time** (`python -m blast`, no network, read-only disk), for each patch:
+
+1. **Apply** it in memory (`blast/patch.py`, checked against `git apply` in the tests).
+2. **Find candidates** (`blast/analyze.py`). A test is a candidate for a changed
+   line only if its process executed that line. Lines that run at import time
+   (class bodies, module constants) are executed by almost every test, so they
+   are narrowed to tests that used the enclosing class and executed code that
+   reads the changed name. Data files map to the tests that opened them.
+   Comment-only edits have no candidates unless a test reads the file.
+3. **Check** (`blast/runner.py`). The patched tree is laid out in `/tmp` as
+   symlinks plus the patched files (`blast/workspace.py`), and the cheap
+   candidates are run on it in a forked child. On the first failure the run
+   stops and every candidate not yet seen to pass is selected. If all pass,
+   nothing is selected. Running tests costs CPU seconds, so a run only happens
+   when its expected cost beats selecting the candidates unchecked.
+4. **Split** the selected tests over 1–8 workers to minimise
+   `busiest worker + 2 s × workers` (`blast/schedule.py`).
+
+### Conservative fallbacks
+
+| Situation | What happens |
 | --- | --- |
-| `/data/commits/<id>.patch` | One unified diff against the pinned commit. Each stands alone: none builds on another. |
-| `/data/tests.json` | Every test, numbered, with its file and the seconds it took us to run. |
-| stdout | One JSON line a commit: `{"commit": "k7q2", "workers": [[12, 845, 901], [3, 77]]}` |
+| Patch cannot be parsed or does not apply | select every test |
+| Any exception while deciding a commit | select every test |
+| A changed module no longer imports, or a test file fails collection | select every test that imports it |
+| pytest does not start, or a probe of every test file fails (broken `conftest.py`, `pyproject.toml`, shadowing module) | select every test |
+| A test times out or the child dies inside a test | that test counts as failing |
+| Renamed-and-edited files, unparsable sources | select every test |
+| Out of time (100 s of wall clock used) | later commits are selected from the maps without running anything |
+| A lane crashes or the hard stop (150 s) is reached | unanswered commits get every test |
 
-Each inner list is one worker's test numbers. `"workers": []` runs nothing, which is the right answer for a change that breaks nothing.
+## Layout
 
-## Scoring
+    Dockerfile            two stages: clone sqlglot, then build maps in the labelled image
+    blast/__main__.py     orchestration and the check-or-select decision
+    blast/analyze.py      patch -> candidate tests, from the maps
+    blast/patch.py        unified diff parser and in-memory applier
+    blast/runner.py       forked pytest runs that stream each test's outcome
+    blast/schedule.py     worker split
+    blast/static_index.py per-line index of the pinned sources (build time)
+    blast/tracer.py       per-test line/class/file tracer (build time)
+    blast/workspace.py    symlinked patched tree in /tmp
+    tools/build_maps.py   builds the maps (run by the Dockerfile)
+    tools/check_candidates.py  development check of candidate recall on the sample set
+    tests/                unit tests for the patch applier, scheduler and source index
 
-Lower is better. [SCORING.md](SCORING.md) has the exact rules; in short:
+## Running it
 
-- A commit costs the recorded seconds of its busiest worker, plus 2 seconds for every worker.
-- A commit where you left out a test that fails adds 300 seconds.
-- The CPU seconds your program uses are added. Running sqlglot's tests while you decide is allowed, and you pay for the time.
-- Your image runs 3 times and the middle total counts.
+    make sample           # official: build, run on the 30 samples under the scorer's limits, score
+    make check            # official: output format only
+    python3 -m unittest discover tests     # unit tests (need git on PATH)
 
-"Fails" means pytest reports a failure, an error or a timeout for the test, or the test's file cannot be imported. A test with subtests is one test: one failing subtest fails it.
+`sample/` (the kit's public commits and answers) and `output.jsonl` are not
+tracked in Git; unpack the starter kit to get `sample/` back.
 
-## Try it
+Tuning knobs are environment variables read in `blast/__main__.py`
+(`BLAST_HEAVY`, `BLAST_EVIDENCE`, `BLAST_DEADLINE`, ...). Set `BLAST_DEBUG=1`
+to see pytest's own output on stderr.
 
-You need Docker, make and Python 3.9 or newer. The kit unpacks into the folder you are in, so unpack it into an empty one.
+## License
 
-```sh
-make sample   # build, run once on the 30 sample commits under the scorer's limits, and score
-make check    # the output's format only
-```
-
-`make sample` prints your simulated seconds and misses, which are exact for that output. The board adds the CPU seconds your container used and takes the middle of 3 runs, so expect it a little higher. Your program never sees `sample/answers.json`: only the patches and `tests.json` are mounted.
-
-`sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
-
-## Submit
-
-Push to a public GitHub repository with the `Dockerfile` at its top, then enter the repository and the commit hash on the track page. The final scores the commit you pick. If you pick none, your best practice submission counts.
-
-## Rules
-
-- Submit your own team's repository. A submission with the same repository, commit or archive as another team's is disqualified, the later one.
-- Your build may download only from public package registries: PyPI, npm, Docker Hub, GitHub releases at a fixed tag, and sqlglot’s own repository at the pinned commit. Nothing from an address your team controls. The final rebuilds every image after the cutoff, so anything else could change a submission after the deadline.
-- No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to the tests it breaks. Maps built from the pinned commit (coverage, imports, fixtures) are allowed. Top entries are read.
-- Only the final counts. The practice board carries no prize.
-
-## How your image runs
-
-- The build has the network, 4 cores, 8 GB of memory and 10 minutes. It may clone sqlglot at the pinned commit, install it and run its tests to make coverage or import maps.
-- Your repository may hold 20 MB. Git submodules and Git LFS files are not fetched: clone sqlglot in the `Dockerfile` and commit maps as plain files.
-- The run has no network, 2 cores, 4 GB of memory and 3 minutes for the whole batch (4.5 in the final, which has about one and a half times as many commits).
-- The disk is read-only. `/tmp` holds 64 MB and is empty at the start of every run.
-- The container runs as user `nobody`, with `HOME=/tmp` and at most 256 processes.
-- stdout may hold 2 MB. More rejects the run.
-
-## Things that will catch you
-
-- Logs go to stderr. Any line on stdout that is not an answer rejects the run.
-- `score.py` names a broken rule by its code, as in `Rejected: not_json on line 1`. The table in SCORING.md says what each code means.
-- Files your program needs must be readable by `nobody`. A map written by `root` during the build with mode 600 is not.
-- pytest 9 prints a test as `PASSED` beside `SUBFAILED` lines when one of its subtests fails. That test failed.
-- sqlglot skips its executor tests unless `SKIP_INTEGRATION=0` is set. We labeled with it set, so those tests can fail.
-- `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
-- The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
-- A change that only adds a comment is not promised to be harmless.
+MIT, see [LICENSE](LICENSE).
