@@ -160,6 +160,27 @@ class InlineExecutor:
         return False
 
 
+def _expand(root: str, smoke) -> list[str]:
+    """Module names to import-check. "*sqlglot" stands for every sqlglot module
+    and "*tests" for every test module, so that a change that breaks class
+    creation or a test file's imports anywhere downstream shows up."""
+    names: list[str] = []
+    for module in smoke:
+        if module not in ("*sqlglot", "*tests"):
+            names.append(module)
+            continue
+        top = module[1:]
+        for directory, _, files in sorted(os.walk(os.path.join(root, top))):
+            if "fixtures" in directory:
+                continue
+            for name in sorted(files):
+                wanted = name.startswith("test_") if top == "tests" else name != "__main__.py"
+                if name.endswith(".py") and wanted:
+                    rel = os.path.relpath(os.path.join(directory, name), root)[:-3].replace(os.sep, ".")
+                    names.append(rel[: -len(".__init__")] if rel.endswith(".__init__") else rel)
+    return list(dict.fromkeys(names))
+
+
 def _child(root, test_ids, out_fd, hooks=None, whole_files=False, fresh=False, pristine=None, smoke=()) -> None:
     os.chdir(root)
     if fresh:
@@ -196,9 +217,11 @@ def _child(root, test_ids, out_fd, hooks=None, whole_files=False, fresh=False, p
         if pid == 0:
             code = 0
             try:
-                for module in smoke:
+                import importlib
+
+                for module in _expand(root, smoke):
                     try:
-                        __import__(module)
+                        importlib.import_module(module)
                     except BaseException:
                         os.write(out_fd, f"I {module}\n".encode())
                         code = 1

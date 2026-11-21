@@ -46,12 +46,12 @@ BUDGET = knob("BLAST_BUDGET", 30.0)
 QUIET_CODE = knob("BLAST_QUIET_CODE", 0.5)
 QUIET_DATA = knob("BLAST_QUIET_DATA", 0.07)
 # When the light tests are too many to run, run this many of the cheapest as a probe.
-PROBE = int(knob("BLAST_PROBE", 40))
+PROBE = int(knob("BLAST_PROBE", 0))
 # After a first failure, keep running until this many tests are checked or this much
 # more CPU is spent; heavy tests are dropped if fewer than this share of them failed.
 SPREAD_TESTS = int(knob("BLAST_SPREAD_TESTS", 30))
 SPREAD_CPU = knob("BLAST_SPREAD_CPU", 0.5)
-SPREAD_SHARE = knob("BLAST_SPREAD_SHARE", 0.1)
+SPREAD_SHARE = knob("BLAST_SPREAD_SHARE", 0.0)
 # When a check run does hit a failure, it has used about this share of its CPU.
 EARLY = knob("BLAST_EARLY", 0.3)
 # Fixed CPU cost of one checking run (fork, import, collection).
@@ -185,9 +185,11 @@ class Selector:
         #   quiet * cpu + (1 - quiet) * (EARLY * cpu + unchecked)  <  unchecked
         quiet = QUIET_DATA if result.data_changed else QUIET_CODE
         worth = light_cpu * (quiet + EARLY * (1 - quiet)) < quiet * blind_cost and light_cpu <= BUDGET
+        smoke = tuple(result.smoke) + ("*sqlglot", "*tests") if result.import_time else ()
         if late or result.outside or not (light or probes):
-            return sorted(candidates), f"unchecked: {note}{' (deadline)' if late else ''}"
-        if worth or result.sample:
+            order = []
+            note = f"unchecked: {note}{' (deadline)' if late else ''}"
+        elif worth or result.sample:
             order = probes + light
         elif heavy and PROBE:
             # Too many light tests to run them all, but the heavy ones dominate the
@@ -195,7 +197,10 @@ class Selector:
             order = light[:PROBE]
             note = f"probe of {len(order)}; {note}"
         else:
-            return sorted(candidates), f"unchecked: {note}"
+            order = []
+            note = f"unchecked: {note}"
+        if not order and (not smoke or late or result.outside):
+            return sorted(candidates), note
 
         root = self.workspace.build(files)
         fresh = result.touches_sqlglot or result.sample
@@ -206,11 +211,12 @@ class Selector:
             limit,
             fresh=fresh,
             pristine=PRISTINE,
-            smoke=tuple(result.smoke) if result.import_time else (),
+            smoke=smoke,
         )
         passed: set[int] = set()
         failed: set[int] = set()
         gone: set[int] = set()
+        bad_modules: list[str] = []
         broken = None
         slow: list[tuple[float, str]] = []
         last_cpu = 0.0
@@ -229,14 +235,14 @@ class Selector:
                 gone.add(number)
             elif kind in "FTX" and number is not None:
                 failed.add(number)
-                if kind in "TX" or not heavy:
+                if kind in "TX" or not heavy or SPREAD_SHARE <= 0:
                     break
             elif kind == "C":
                 broken = f"collection error in {test_id}"
                 break
             elif kind == "I":
-                broken = f"import of {test_id} fails"
-                break
+                bad_modules.append(test_id)
+                broken = f"import of {', '.join(bad_modules[:3])} fails"
             elif kind in "TX":
                 broken = "run died outside a test"
                 break
@@ -247,7 +253,9 @@ class Selector:
                 if len(passed) + len(failed) >= SPREAD_TESTS or extra > SPREAD_CPU:
                     break
         run.kill()
-        if not failed and not broken and set(order) - passed - gone:
+        if broken and broken.startswith("import of"):
+            pass  # the run stopped after the import check, as it should
+        elif not failed and not broken and set(order) - passed - gone:
             # The run ended without reporting every test (pytest refused to start,
             # a conftest or option is broken...): nothing can be trusted.
             broken = "run died before reporting every test"
@@ -259,13 +267,16 @@ class Selector:
             if result.sample or not broken or broken.startswith("run died"):
                 return self.everything, f"everything: {broken or 'probe failed'}"
             wide = set(candidates)
-            for module in result.smoke:
+            for module in [*result.smoke, *bad_modules]:
                 rel = module.replace(".", "/")
                 for path in (rel + ".py", rel + "/__init__.py"):
                     wide |= self.numbers(self.maps.importers(path))
             if broken.startswith("collection"):
                 wide |= {n for n in self.everything if self.file_of[n] == test_id.split("::")[0]}
             return sorted(wide), f"{broken}: {len(wide)} tests"
+        if not order:
+            # Only the import check ran, and it passed.
+            return sorted(candidates), note
         checked = len(passed) + len(failed)
         remaining = candidates - passed
         if failed:
@@ -277,7 +288,9 @@ class Selector:
             return sorted(selected), f"{len(failed)} of {checked} checked fail, {len(dropped)} heavy dropped; {note}"
         if not remaining - gone:
             return sorted(gone), f"all {len(passed)} candidates pass, {len(gone)} removed tests kept; {note}"
-        if len(passed) >= EVIDENCE:
+        if len(passed) >= EVIDENCE and set(light) <= passed:
+            # Every cheap candidate ran and passed: the slow ones are dropped.
+            # A probe of a few passing tests is not enough (it missed test_tpcds once).
             remaining -= set(heavy)
             return sorted(remaining), f"all {len(passed)} checked pass, {len(heavy)} heavy dropped; {note}"
         return sorted(remaining), f"{len(passed)} pass, {len(remaining)} unchecked kept; {note}"

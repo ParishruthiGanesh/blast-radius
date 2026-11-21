@@ -433,7 +433,7 @@ class Analyzer:
         return rel in GLOBAL_FILES or name in GLOBAL_NAMES or name == "conftest.py"
 
     def _note_python(self, result: Result, rel: str) -> None:
-        if rel.startswith("sqlglot/") and rel.endswith(".py"):
+        if rel.startswith(("sqlglot/", "tests/")) and rel.endswith(".py"):
             result.touches_sqlglot = True
             module = rel[:-3].replace("/", ".")
             if module.endswith(".__init__"):
