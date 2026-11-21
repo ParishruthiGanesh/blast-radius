@@ -148,6 +148,20 @@ class Selector:
         if result.everything:
             return self.everything, "everything (analysis gave up)"
         candidates = self.numbers(result.bits)
+        # A file that no longer compiles fails every test that imports it: no need to run anything.
+        uncompilable = []
+        for change, old_text, new_text in triples:
+            rel = change.new_path
+            if rel and rel.endswith(".py") and new_text is not None and new_text != old_text:
+                try:
+                    compile(new_text, rel, "exec", dont_inherit=True)
+                except (SyntaxError, ValueError):
+                    uncompilable.append(rel)
+                    candidates |= self.numbers(self.maps.importers(rel) | self.maps.file_hits(rel))
+        if uncompilable:
+            if any(rel not in self.maps.static for rel in uncompilable):
+                return self.everything, f"everything: {uncompilable} does not compile"
+            return sorted(candidates), f"{uncompilable} does not compile: {len(candidates)} importing tests"
         if candidates or result.sample:
             candidates.update(self.unknown)
         probes = [n for n in self.probes() if n not in candidates] if result.sample else []
@@ -172,7 +186,12 @@ class Selector:
         fresh = result.touches_sqlglot or result.sample
         limit = lambda test_id: 6 * self.cpu(self.number[test_id]) + 6  # noqa: E731
         run = runner.Run(
-            root, [self.name[n] for n in order], limit, fresh=fresh, pristine=PRISTINE, smoke=tuple(result.smoke)
+            root,
+            [self.name[n] for n in order],
+            limit,
+            fresh=fresh,
+            pristine=PRISTINE,
+            smoke=tuple(result.smoke) if result.import_time else (),
         )
         passed: set[int] = set()
         failed: set[int] = set()
@@ -187,7 +206,7 @@ class Selector:
                 slow.append((last_cpu, test_id))
             if kind == "P":
                 passed.add(number)
-            elif kind in "FTM" and number is not None:
+            elif kind in "FTMX" and number is not None:
                 failed.add(number)
                 break
             elif kind == "C":

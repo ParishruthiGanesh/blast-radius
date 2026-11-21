@@ -189,15 +189,28 @@ def _child(root, test_ids, out_fd, hooks=None, whole_files=False, fresh=False, p
         hooks.begin()
     import pytest
 
+    if smoke:
+        # Do the changed modules still import? Asked in a throwaway fork, so eager
+        # imports cannot disturb tests that depend on lazy loading.
+        pid = os.fork()
+        if pid == 0:
+            code = 0
+            try:
+                for module in smoke:
+                    try:
+                        __import__(module)
+                    except BaseException:
+                        os.write(out_fd, f"I {module}\n".encode())
+                        code = 1
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        if status != 0:
+            os.write(out_fd, b"E done\n")
+            return
     files = sorted({test_id.split("::", 1)[0] for test_id in test_ids})
     if files:
         pytest.main(PYTEST_ARGS + files, plugins=[_Reporter(test_ids, out_fd, hooks, whole_files)])
-    # Last, so that eager imports cannot disturb tests that check lazy loading.
-    for module in smoke:
-        try:
-            __import__(module)
-        except BaseException:
-            os.write(out_fd, f"I {module}\n".encode())
     os.write(out_fd, b"E done\n")
 
 

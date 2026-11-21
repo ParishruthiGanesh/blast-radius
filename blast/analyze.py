@@ -36,6 +36,7 @@ class Result:
     smoke: list[str] = field(default_factory=list)  # modules to import-check
     touches_sqlglot: bool = False
     data_changed: bool = False  # a non-Python file that some test reads was edited
+    import_time: bool = False  # code that runs when a module is imported changed
     notes: list[str] = field(default_factory=list)
 
 
@@ -81,6 +82,16 @@ class Maps:
             for line, pair in table.items():
                 if first <= line <= last:
                     bits |= pair[0] | pair[1]
+        return bits
+
+    def run_hits(self, rel: str, first: int, last: int) -> int:
+        """Like hits(), but only lines executed while a test ran (not at import)."""
+        bits = 0
+        table = self.lines.get(rel, {})
+        for line in range(first, last + 1):
+            pair = table.get(line)
+            if pair:
+                bits |= pair[1]
         return bits
 
     def file_hits(self, rel: str) -> int:
@@ -146,7 +157,7 @@ class Maps:
                     self._sources[rel] = []
         return self._sources
 
-    def use_hits(self, names: tuple[str, ...]) -> int | None:
+    def use_hits(self, names: tuple[str, ...], run_only: bool = False) -> int | None:
         """Tests that executed code mentioning any of `names`, following names
         derived from them at import time. None means "cannot tell"."""
         pending = list(names)
@@ -162,6 +173,7 @@ class Maps:
             cached = self._use_cache.get(name, 0)
             if cached is None:
                 return None
+            hits = self.run_hits if run_only else self.hits
             pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])")
             sites = 0
             for rel, text in self.sources().items():
@@ -175,14 +187,14 @@ class Maps:
                         if not units:
                             function = self.enclosing_function(rel, number)
                             if function:
-                                bits |= self.hits(rel, *function)
+                                bits |= hits(rel, *function)
                             continue
                         for unit in units:
                             kind = unit[KIND]
                             if kind == "f":
-                                bits |= self.hits(rel, unit[START], unit[END])
+                                bits |= hits(rel, unit[START], unit[END])
                             elif kind == "d":
-                                bits |= self.hits(rel, *unit[FUNC])
+                                bits |= hits(rel, *unit[FUNC])
                             elif kind == "k":
                                 if name not in unit[NAMES]:
                                     return None  # used as a base class or decorator
@@ -296,6 +308,56 @@ def _entry_names(source: list[str], unit: tuple, first: int, last: int) -> tuple
     return names, has_lambda
 
 
+def _statement_run(lines: list[str]) -> int | None:
+    """If `lines` are whole statements written at one indentation, return that
+    indentation; otherwise None."""
+    code = [line for line in lines if not _is_comment(line)]
+    if not code:
+        return None
+    base = _indent(code[0])
+    if any(_indent(line) < base for line in code):
+        return None
+    try:
+        ast.parse(textwrap.dedent("\n".join(lines)))
+    except (SyntaxError, ValueError):
+        return None
+    return base
+
+
+def _lambda_holding(source: list[str], unit: tuple, line: int, start: int, end: int) -> int | None:
+    """If columns [start, end) of `line` lie wholly inside the body of a lambda
+    written in this import-time statement, return the line the lambda starts on."""
+    raw = source[unit[START] - 1 : unit[END]]
+    margin = min((_indent(row) for row in raw if row.strip()), default=0)
+    try:
+        tree = ast.parse(textwrap.dedent("\n".join(raw)))
+    except (SyntaxError, ValueError):
+        return None
+    where_start = (line - unit[START] + 1, start - margin)
+    where_end = (line - unit[START] + 1, end - margin)
+    best = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Lambda):
+            body_start = (node.body.lineno, node.body.col_offset)
+            body_end = (node.body.end_lineno, node.body.end_col_offset)
+            if body_start <= where_start and where_end <= body_end:
+                if best is None or node.lineno >= best:
+                    best = node.lineno
+    return None if best is None else best + unit[START] - 1
+
+
+def _changed_span(old: str, new: str) -> tuple[int, int]:
+    """Columns of `old` that differ from `new` (common prefix and suffix removed)."""
+    prefix = 0
+    limit = min(len(old), len(new))
+    while prefix < limit and old[prefix] == new[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < limit - prefix and old[-1 - suffix] == new[-1 - suffix]:
+        suffix += 1
+    return prefix, max(prefix, len(old) - suffix)
+
+
 class Analyzer:
     def __init__(self, maps: Maps):
         self.maps = maps
@@ -343,6 +405,7 @@ class Analyzer:
             result.notes.append(f"new run-wide file {rel}")
         if rel.endswith(".py"):
             self._note_python(result, rel)
+            result.import_time = True
             stem = rel[:-3]
             top = rel.split("/")[0]
             shadows = exists(stem) or (directory == "" and top not in ("setup.py",))
@@ -361,7 +424,7 @@ class Analyzer:
             result.sample = True
         if rel.endswith(".py"):
             self._note_python(result, rel)
-            result.touches_sqlglot = result.touches_sqlglot or rel.startswith("sqlglot/")
+            result.import_time = True
 
     # --- edits inside a file ------------------------------------------------------
 
@@ -421,8 +484,17 @@ class Analyzer:
             )
             if covered and units:
                 for unit in units:
+                    if unit[KIND] in "cm" and unit[INNER] and len(block.old) == 1:
+                        # Only the inside of a lambda changed: its callers alone can tell.
+                        span = _changed_span(block.old[0], block.new[0])
+                        holder = _lambda_holding(old_lines, unit, first, *span)
+                        if holder is not None:
+                            result.bits |= maps.entered_bits(rel, holder)
+                            continue
                     self._unit(result, rel, unit, max(first, unit[START]), min(last, unit[END]), (), True)
                 return
+        if self._statements(result, rel, block, old_lines):
+            return
         # Structural change: lines added or removed, or indentation moved.
         low = max(1, first - 1)
         high = last + 1 if block.old else first
@@ -457,11 +529,69 @@ class Analyzer:
                 self._import_time(result, rel, unit, max(low, unit[START]), min(high, unit[END]), names, bool(new_names) or not block.new)
                 handled = True
         if not handled:
+            result.import_time = True
             result.bits |= maps.importers(rel)
+
+    def _statements(self, result: Result, rel: str, block: Block, old_lines: list[str]) -> bool:
+        """Whole statements removed, added or replaced inside one function body.
+
+        Removing or replacing statements matters only to tests that executed
+        them. An added statement matters only to tests that reached the place
+        where it now stands: those that ran the statement right after it, or,
+        at the end of a block, the statement right before it.
+        """
+        maps = self.maps
+        first = block.start
+        last = block.start + len(block.old) - 1
+        old_base = _statement_run(block.old) if block.old else None
+        new_base = _statement_run(block.new) if block.new else None
+        if block.old and old_base is None or block.new and new_base is None:
+            return False
+        if old_base is not None and new_base is not None and old_base != new_base:
+            return False
+        base = old_base if old_base is not None else new_base
+        function = maps.enclosing_function(rel, first if block.old else max(1, first - 1))
+        if function is None or base is None:
+            return False
+        # Every touched line must sit inside the body of that one function.
+        header = [u for u in maps.units_overlapping(rel, function[0], function[0]) if u[KIND] == "d" and u[FUNC] == function]
+        if not header or not (header[0][END] < first and last <= function[1] and first <= function[1] + 1):
+            return False
+        if block.old:
+            units = maps.units_overlapping(rel, first, last)
+            if any(u[KIND] != "f" or u[FUNC] != function for u in units):
+                # A nested def inside the removed lines is fine; anything else is not.
+                if any(u[KIND] not in "fd" or not (function[0] <= u[START] and u[END] <= function[1]) for u in units):
+                    return False
+        # The line after the block must not be swallowed by, or orphaned from, a compound statement.
+        after = last + 1 if block.old else first
+        while after <= len(old_lines) and _is_comment(old_lines[after - 1]):
+            after += 1
+        after_indent = _indent(old_lines[after - 1]) if after <= min(len(old_lines), function[1]) else -1
+        if after_indent > base:
+            return False
+        if block.old:
+            result.bits |= maps.hits(rel, first, last)
+            return True
+        if after_indent == base:
+            anchor = after
+        else:
+            anchor = first - 1
+            while anchor > function[0] and (_is_comment(old_lines[anchor - 1]) or _indent(old_lines[anchor - 1]) > base):
+                anchor -= 1
+            if _indent(old_lines[anchor - 1]) != base:
+                return False
+        units = [u for u in maps.units_overlapping(rel, anchor, anchor) if u[KIND] == "f" and u[FUNC] == function]
+        if not units:
+            return False
+        for unit in units:
+            result.bits |= maps.hits(rel, unit[START], unit[END])
+        return True
 
     def _scope_change(self, result: Result, rel: str, classes: tuple[str, ...], kind: str, names: tuple[str, ...], line: int) -> None:
         """New code placed directly in a class or module body."""
         maps = self.maps
+        result.import_time = True
         base = maps.importers(rel)
         if classes:
             touch = maps.class_touch(rel, classes)
@@ -489,6 +619,7 @@ class Analyzer:
     def _import_time(self, result: Result, rel: str, unit: tuple, first: int, last: int, names: tuple[str, ...], narrow: bool) -> None:
         """A statement that runs when its module is imported changed."""
         maps = self.maps
+        result.import_time = True
         base = maps.hits(rel, first, last) or maps.hits(rel, unit[START], unit[END]) or maps.importers(rel)
         if unit[CLASSES]:
             touch = maps.class_touch(rel, unit[CLASSES])
@@ -499,7 +630,12 @@ class Analyzer:
             for start, end in unit[INNER]:
                 if start <= last and end >= first:
                     lambdas |= maps.entered_bits(rel, start)
-        if unit[KIND] != "k" and names and narrow:
+        if names == ("__doc__",) and narrow:
+            # A docstring: only code that reads __doc__ while a test runs can notice.
+            use = maps.use_hits(names, run_only=True)
+            if use is not None:
+                base &= use
+        elif unit[KIND] != "k" and names and narrow:
             use = maps.use_hits(names)
             if use is not None and use:
                 base &= use
