@@ -86,6 +86,11 @@ Tuning knobs are environment variables read in `blast/__main__.py`
 (`BLAST_HEAVY`, `BLAST_EVIDENCE`, `BLAST_DEADLINE`, ...). Set `BLAST_DEBUG=1`
 to see pytest's own output on stderr.
 
+## Results
+
+See [RESULTS.md](RESULTS.md) for the scores, the commands that produced them
+and the remaining limitations.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
