@@ -60,6 +60,12 @@ class Maps:
             if module.startswith("sqlglot.expressions") and "." not in qualname:
                 self.class_by_name[qualname] = self.class_by_name.get(qualname, 0) | bits
         self._expressions = None
+        # Tests that import sqlglot afresh while they run (a `python -c` subprocess):
+        # they re-execute import-time code, so any import-time change may affect them.
+        self.reimporters = 0
+        for unit in self.static.get("sqlglot/__init__.py", {}).get("units", ()):
+            if unit[KIND] in "mk":
+                self.reimporters |= self.run_hits("sqlglot/__init__.py", unit[START], unit[END])
         self._sources: dict[str, list[str]] | None = None
         self._unit_starts: dict[str, list[int]] = {}
         self._use_cache: dict[str, int | None] = {}
@@ -637,10 +643,22 @@ class Analyzer:
             result.bits |= maps.hits(rel, unit[START], unit[END])
         return True
 
+    def _reimport_bits(self, rel: str) -> int:
+        """Re-importing tests that executed this module's import-time code."""
+        maps = self.maps
+        if not maps.reimporters:
+            return 0
+        bits = 0
+        for unit in maps.static.get(rel, {}).get("units", ()):
+            if unit[KIND] in "mkc":
+                bits |= maps.run_hits(rel, unit[START], unit[END])
+        return bits & maps.reimporters
+
     def _scope_change(self, result: Result, rel: str, classes: tuple[str, ...], kind: str, names: tuple[str, ...], line: int) -> None:
         """New code placed directly in a class or module body."""
         maps = self.maps
         result.import_time = True
+        result.bits |= self._reimport_bits(rel)
         base = maps.importers(rel)
         if any(qualname in maps.static[rel].get("enums", ()) for qualname in classes):
             result.bits |= base
@@ -676,6 +694,7 @@ class Analyzer:
         """A statement that runs when its module is imported changed."""
         maps = self.maps
         result.import_time = True
+        result.bits |= self._reimport_bits(rel)
         base = maps.hits(rel, first, last) or maps.hits(rel, unit[START], unit[END]) or maps.importers(rel)
         if names != ("__doc__",) and any(qualname in maps.static[rel].get("enums", ()) for qualname in unit[CLASSES]):
             # Enum members are reached by value and by iteration: every importer may notice.
