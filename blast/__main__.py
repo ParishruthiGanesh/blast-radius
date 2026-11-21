@@ -185,7 +185,7 @@ class Selector:
         #   quiet * cpu + (1 - quiet) * (EARLY * cpu + unchecked)  <  unchecked
         quiet = QUIET_DATA if result.data_changed else QUIET_CODE
         worth = light_cpu * (quiet + EARLY * (1 - quiet)) < quiet * blind_cost and light_cpu <= BUDGET
-        if late or not (light or probes):
+        if late or result.outside or not (light or probes):
             return sorted(candidates), f"unchecked: {note}{' (deadline)' if late else ''}"
         if worth or result.sample:
             order = probes + light
@@ -210,6 +210,7 @@ class Selector:
         )
         passed: set[int] = set()
         failed: set[int] = set()
+        gone: set[int] = set()
         broken = None
         slow: list[tuple[float, str]] = []
         last_cpu = 0.0
@@ -222,7 +223,11 @@ class Selector:
                 slow.append((last_cpu, test_id))
             if kind == "P":
                 passed.add(number)
-            elif kind in "FTMX" and number is not None:
+            elif kind == "M" and number is not None:
+                # The patch removed this test. Select it to be safe, but its
+                # absence says nothing about the other candidates.
+                gone.add(number)
+            elif kind in "FTX" and number is not None:
                 failed.add(number)
                 if kind in "TX" or not heavy:
                     break
@@ -242,7 +247,7 @@ class Selector:
                 if len(passed) + len(failed) >= SPREAD_TESTS or extra > SPREAD_CPU:
                     break
         run.kill()
-        if not failed and not broken and set(order) - passed:
+        if not failed and not broken and set(order) - passed - gone:
             # The run ended without reporting every test (pytest refused to start,
             # a conftest or option is broken...): nothing can be trusted.
             broken = "run died before reporting every test"
@@ -270,8 +275,8 @@ class Selector:
             dropped = set(heavy) if narrow else set()
             selected = (remaining | failed) - dropped
             return sorted(selected), f"{len(failed)} of {checked} checked fail, {len(dropped)} heavy dropped; {note}"
-        if not remaining:
-            return [], f"all {len(passed)} candidates pass; {note}"
+        if not remaining - gone:
+            return sorted(gone), f"all {len(passed)} candidates pass, {len(gone)} removed tests kept; {note}"
         if len(passed) >= EVIDENCE:
             remaining -= set(heavy)
             return sorted(remaining), f"all {len(passed)} checked pass, {len(heavy)} heavy dropped; {note}"

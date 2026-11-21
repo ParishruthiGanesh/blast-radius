@@ -37,6 +37,7 @@ class Result:
     touches_sqlglot: bool = False
     data_changed: bool = False  # a non-Python file that some test reads was edited
     import_time: bool = False  # code that runs when a module is imported changed
+    outside: bool = False  # a file outside sqlglot/ and tests/ that some test reads changed
     notes: list[str] = field(default_factory=list)
 
 
@@ -393,6 +394,11 @@ class Analyzer:
         for change, old_text, new_text in changes:
             if change.mode_only or old_text == new_text and change.old_path == change.new_path:
                 continue
+            for rel in (change.old_path, change.new_path):
+                # Some tests find such files through resolved paths, which lead out of
+                # the symlinked check tree: their readers are selected without a check run.
+                if rel and not rel.startswith(("sqlglot/", "tests/")) and self.maps.opened.get(rel, 0):
+                    result.outside = True
             if change.old_path and change.new_path and change.old_path != change.new_path:
                 self._removed(result, change.old_path)
                 self._added(result, change.new_path, exists)
@@ -657,7 +663,7 @@ class Analyzer:
         maps = self.maps
         result.import_time = True
         base = maps.hits(rel, first, last) or maps.hits(rel, unit[START], unit[END]) or maps.importers(rel)
-        if any(qualname in maps.static[rel].get("enums", ()) for qualname in unit[CLASSES]):
+        if names != ("__doc__",) and any(qualname in maps.static[rel].get("enums", ()) for qualname in unit[CLASSES]):
             # Enum members are reached by value and by iteration: every importer may notice.
             result.bits |= base
             return
