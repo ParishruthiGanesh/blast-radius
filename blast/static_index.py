@@ -108,7 +108,19 @@ def index_source(source: str) -> dict:
 
     visit(tree.body, "m", None, ())
     units.sort()
-    return {"units": units, "functions": sorted(functions), "lines": source.count("\n") + 1}
+    bases: dict[str, list[str]] = {}
+
+    def collect(body: list[ast.stmt], prefix: str) -> None:
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                qualname = prefix + node.name
+                bases[qualname] = [
+                    base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "") for base in node.bases
+                ]
+                collect(node.body, qualname + ".")
+
+    collect(tree.body, "")
+    return {"units": units, "functions": sorted(functions), "lines": source.count("\n") + 1, "bases": bases}
 
 
 def build(root: str) -> dict[str, dict]:
@@ -123,5 +135,30 @@ def build(root: str) -> dict[str, dict]:
                         try:
                             index[rel] = index_source(handle.read())
                         except SyntaxError:
-                            index[rel] = {"units": [], "functions": [], "lines": 0}
+                            index[rel] = {"units": [], "functions": [], "lines": 0, "bases": {}}
+    mark_enums(index)
     return index
+
+
+ENUM_ROOTS = {"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum"}
+
+
+def mark_enums(index: dict[str, dict]) -> None:
+    """Add `enums` to each file's entry: its classes that derive from Enum.
+
+    Enum members are found by value and by iteration, not only by name, so
+    the analysis must not narrow a change inside one by who names it.
+    Inheritance is followed by class name across the whole checkout.
+    """
+    enum_names = set(ENUM_ROOTS)
+    changed = True
+    while changed:
+        changed = False
+        for entry in index.values():
+            for qualname, bases in entry["bases"].items():
+                name = qualname.rsplit(".", 1)[-1]
+                if name not in enum_names and any(base in enum_names for base in bases):
+                    enum_names.add(name)
+                    changed = True
+    for entry in index.values():
+        entry["enums"] = sorted(q for q in entry["bases"] if q.rsplit(".", 1)[-1] in enum_names)

@@ -77,5 +77,18 @@ class TestStaticIndex(unittest.TestCase):
         self.assertIn((30, 34), self.index["functions"])
 
 
+class TestEnums(unittest.TestCase):
+    def test_enum_inheritance_is_followed_across_files(self):
+        from blast.static_index import mark_enums
+
+        index = {
+            "a.py": index_source("from enum import Enum\n\n\nclass AutoName(Enum):\n    pass\n"),
+            "b.py": index_source("class Kind(AutoName):\n    A = 1\n\n\nclass Box:\n    class Mode(helper.AutoName):\n        X = 1\n"),
+        }
+        mark_enums(index)
+        self.assertEqual(index["a.py"]["enums"], ["AutoName"])
+        self.assertEqual(index["b.py"]["enums"], ["Box.Mode", "Kind"])
+
+
 if __name__ == "__main__":
     unittest.main()

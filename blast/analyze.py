@@ -622,6 +622,9 @@ class Analyzer:
         maps = self.maps
         result.import_time = True
         base = maps.importers(rel)
+        if any(qualname in maps.static[rel].get("enums", ()) for qualname in classes):
+            result.bits |= base
+            return
         if classes:
             touch = maps.class_touch(rel, classes)
             if touch:
@@ -654,6 +657,10 @@ class Analyzer:
         maps = self.maps
         result.import_time = True
         base = maps.hits(rel, first, last) or maps.hits(rel, unit[START], unit[END]) or maps.importers(rel)
+        if any(qualname in maps.static[rel].get("enums", ()) for qualname in unit[CLASSES]):
+            # Enum members are reached by value and by iteration: every importer may notice.
+            result.bits |= base
+            return
         if unit[CLASSES]:
             touch = maps.class_touch(rel, unit[CLASSES])
             if touch:
