@@ -1,0 +1,7 @@
+# Public sample data from the starter kit and anything generated from it stay out of Git.
+sample/
+output.jsonl
+maps/
+__pycache__/
+*.pyc
+.env
