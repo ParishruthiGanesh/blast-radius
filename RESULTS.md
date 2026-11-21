@@ -5,6 +5,28 @@ All numbers below were produced in this repository's working copy on
 `Makefile` (`--cpus 2 --memory 4096m --pids-limit 256 --read-only --network none`,
 user `nobody`, 64 MB `/tmp`).
 
+## Practice board
+
+| Submission | Commit | Score | Detail |
+| --- | --- | ---: | --- |
+| BB-51FED47C | `0c82ecf` | 472.2 s | 3 runs: 451.522 s simulated (incl. 1 missed commit = 300 s), 20.5–21.0 s CPU |
+
+The miss was deterministic. Two causes were then reproduced on locally
+labelled patches and fixed in `9817db1`:
+
+1. A probe of the 40 cheapest candidates all passed, so the slow
+   `test_tpcds` was dropped; it failed (synthetic `s026`, an edit to a
+   type-coercion table). Slow tests are now dropped only when every cheap
+   candidate ran and passed; probes and the "few cheap tests fail" rule are off.
+2. An import-time change broke the imports of many test files, which only a
+   check run noticed; commits judged too costly to check skipped it
+   (synthetic `s019`). Every commit that changes import-time code now
+   imports all sqlglot modules and all test modules first (~0.3 s CPU) and
+   selects every importer of whatever fails.
+
+Which of these (if either) was the board's miss is not known; the board
+does not say which commit missed.
+
 ## Official sample scorer (30 public commits)
 
 | Run | Simulated s | Misses | Selector CPU s (self-reported) | Total |
@@ -51,8 +73,8 @@ official answer for sample `2jrq` exactly.
 
 | Set | Labelled | Misses | Simulated s | Notes |
 | --- | ---: | ---: | ---: | --- |
-| synthetic set 1 | 94 | 0 | 836.3 | ideal 518.6 |
-| synthetic set 2 | 24 of 90 (labelling still running) | 0 | 146.2 | |
+| synthetic set 1 | 94 | 0 | 958.0 | ideal 518.6 (836.3 before the fix, also 0 misses) |
+| synthetic set 2 | 30 of 90 (labelling still running) | 0 | 290.8 | before the fix: 1 miss (`s026`) |
 
 Bugs this found and fixed: dropped added lines in the patch applier, a
 table-entry rule that ignored the new key, Enum members changed by value,
@@ -88,12 +110,11 @@ run.
   Probes and the "check before selecting" step reduce, but do not remove, this
   risk.
 - Dropping the heavy tests (`test_execute_tpcds`, `test_max_nodes`,
-  `test_tpcds`, `test_optimized_tpch`) relies on the cheaper candidates
-  passing, or failing in fewer than 10% of 30+ checked. In the labelled sets
-  these heavy tests never failed under those conditions, but the rule is
-  empirical.
+  `test_tpcds`, `test_optimized_tpch`) still happens when every cheaper
+  candidate ran and passed. A change visible only to a heavy test (for
+  example the node counting that only `test_max_nodes` checks) would be missed.
 - Selector CPU (about 25 s on the samples) is now a fifth of the total; most
   of it goes to checking commits whose unchecked selection would cost more.
 - Wide changes (core parser, tokenizer, expression base classes) still select
   ~1,500 tests at ~19 s, against an ideal of 0–6 s.
-- Nothing here has been submitted or pushed; the board score is unknown.
+- The fixed commit has not been submitted yet; its board score is unknown.
